@@ -2,7 +2,7 @@ Perfetto! Ecco il README completo basato sui tuoi file definitivi:
 
 # Kafka Satellite Data Pipeline
 
-A distributed processing system for generating crop classification datasets from Sentinel-2 satellite imagery using Apache Kafka/Redpanda for task distribution across multiple worker nodes [web:22][web:30].
+A distributed processing system for generating crop classification datasets from Sentinel-2 satellite imagery using Apache Kafka/Redpanda for task distribution across multiple worker nodes .
 
 ## Overview
 
@@ -172,7 +172,7 @@ sudo docker exec -it redpanda rpk topic create satellite-tasks --partitions 10
 ```
 ### Increase Partitions
 
-More partitions = more parallel workers supported [web:30]:
+More partitions = more parallel workers supported :
 
 ```
 # Delete and recreate topic with more partitions
