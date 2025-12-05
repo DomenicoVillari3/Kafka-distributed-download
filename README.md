@@ -1,4 +1,3 @@
-Perfetto! Ecco il README completo basato sui tuoi file definitivi:
 
 # Kafka Satellite Data Pipeline
 
