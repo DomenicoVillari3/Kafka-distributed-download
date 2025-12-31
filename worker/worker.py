@@ -91,10 +91,10 @@ class SatelliteDataWorkerBalanced:
 
          # Aggiungi periodi stagionali
         seasonal_periods = {
-            'winter': ("2023-01-01/2023-03-20", 20),   # (range, max_cloud)
+            #'winter': ("2023-01-01/2023-03-20", 20),   # (range, max_cloud)
             'spring': ("2023-03-21/2023-06-20", 20),
             'summer': ("2023-06-21/2023-09-22", 20),
-            'autumn': ("2023-09-23/2023-12-20", 20)
+            #'autumn': ("2023-09-23/2023-12-20", 20)
         }
         season_keys = list(seasonal_periods.keys())
         season = random.choice(season_keys)
