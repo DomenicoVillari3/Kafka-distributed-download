@@ -83,115 +83,114 @@ class SatelliteDataWorkerBalanced:
             'fallow_land_not_crop': 8, 'bare_arable_land': 8
         }
         
-        self.assets = ["blue", "green", "red", "nir", "rededge1",
-                      "rededge2", "rededge3", "nir08", "swir16", "swir22"]
+        # Nel __init__ del Worker
+        self.assets = [
+            "blue",    # B02
+            "green",   # B03
+            "red",     # B04
+            "nir08",   # B8A (Narrow NIR richiesto da Prithvi)
+            "swir16",  # B11
+            "swir22"   # B12
+        ]
     
     def get_sentinel_data(self, bbox):
-        """Scarica dati Sentinel-2 per il bbox"""
-
-         # Aggiungi periodi stagionali
+        """Scarica una serie temporale di 4 immagini Sentinel-2 (6 bande) per Prithvi"""
+        
+        # 1. Definiamo i 4 periodi (uno per stagione)
+        # Usiamo date fisse del 2023 per coerenza tra tutti i worker
         seasonal_periods = {
-            #'winter': ("2023-01-01/2023-03-20", 20),   # (range, max_cloud)
-            'spring': ("2023-03-21/2023-06-20", 20),
-            'summer': ("2023-06-21/2023-09-22", 20),
-            #'autumn': ("2023-09-23/2023-12-20", 20)
+            'winter': "2023-01-01/2023-02-28",
+            'spring': "2023-04-15/2023-05-30",
+            'summer': "2023-07-01/2023-08-15",
+            'autumn': "2023-10-01/2023-11-15"
         }
-        season_keys = list(seasonal_periods.keys())
-        season = random.choice(season_keys)
-
-
-        date_range, max_cloud = seasonal_periods[season]
-
-
+        
+        # Ordine temporale rigoroso per il cubo 4D
+        ordered_seasons = ['winter', 'spring', 'summer', 'autumn']
+        
+        # Usiamo solo le 6 bande richieste da Prithvi
+        # Assicurati che self.assets nel costruttore sia: 
+        # ["blue", "green", "red", "nir08", "swir16", "swir22"]
+        
+        stac_items = []
+    
         try:
-            catalog = pystac_client.Client.open(
-                "https://earth-search.aws.element84.com/v1"
-            )
-            search = catalog.search(
-                collections=["sentinel-2-l2a"],
-                bbox=bbox,
-                datetime=date_range,
-                query={"eo:cloud_cover": {"lt": max_cloud}}
-            )
+            catalog = pystac_client.Client.open("https://earth-search.aws.element84.com/v1")
             
-            items = search.item_collection()
-
-            if not len(items):
-                logger.warning(f"No images for {season}, for bboc {bbox} trying all seasons...")
+            for season in ordered_seasons:
+                date_range = seasonal_periods[season]
                 
-                # Prova tutte le stagioni con cloud cover incrementale
-                for fallback_season, (fallback_range, fallback_cloud) in seasonal_periods.items():
-                    search = catalog.search(
-                        collections=["sentinel-2-l2a"],
-                        bbox=bbox,
-                        datetime=fallback_range,
-                        query={"eo:cloud_cover": {"lt": fallback_cloud + 10}}
-                    )
-                    items = search.item_collection()
-                    if len(items):
-                        season = fallback_season
-                        logger.debug(f"  Using fallback: {season}")
-                        break
-
-                    if not len(items):
-                        return None
-            
-            # Seleziona immagine con meno cloud
-            selected_item = min(items, key=lambda x: x.properties['eo:cloud_cover'])
-            
-            logger.info(
-                f"  Season: {season}, Date: {selected_item.datetime.date()}, "
-                f"Cloud: {selected_item.properties['eo:cloud_cover']:.1f}%"
-            )
-            
+                # Cerchiamo l'immagine migliore per la stagione
+                search = catalog.search(
+                    collections=["sentinel-2-l2a"],
+                    bbox=bbox,
+                    datetime=date_range,
+                    query={"eo:cloud_cover": {"lt": 20}} # Max 20% nuvole
+                )
+                
+                items = search.item_collection()
+                
+                if not len(items):
+                    # Se manca anche una sola stagione, il "cubo temporale" è incompleto
+                    logger.warning(f"Manca immagine per {season} in {bbox}. Task scartato.")
+                    return None
+                
+                # Prendiamo quella con meno nuvole
+                best_item = min(items, key=lambda x: x.properties['eo:cloud_cover'])
+                stac_items.append(best_item)
+                
+            # 2. Carichiamo tutte e 4 le immagini insieme come un unico cubo
+            # stackstac creerà una dimensione 'time' di dimensione 4
             data = stackstac.stack(
-                [items[0]],
+                stac_items,
                 assets=self.assets,
                 bounds_latlon=bbox,
                 resolution=10,
-                epsg=32630,
+                epsg=32630, # UTM zone 30N (adatta per Spagna/Ovest Europa)
                 fill_value=0,
                 rescale=False
             )
             
-            if data.sizes['time'] == 0:
+            # 3. Controllo integrità e computazione
+            # Shape attesa: (time: 4, band: 6, y: 256, x: 256)
+            if data.sizes['time'] < 4:
                 return None
+                
+            logger.info(f" ✓ Download completato per 4 stagioni su bbox {bbox}")
             
-            return data.isel(time=0).astype("uint16").compute()
-            
+            # Ritorniamo il cubo NumPy [T, C, H, W]
+            return data.astype("uint16").compute().values
+        
         except Exception as e:
-            logger.error(f"Error downloading: {e}")
+            logger.error(f"Errore durante il download multi-temporale: {e}")
             return None
     
-    def save_chip(self, img_arr, mask_arr, transform, crs, filename):
-        """Salva chip e maschera su disco condiviso"""
+    def save_chip(self, img_cube, mask_arr, filename):
+        """Salva il cubo 4D come .npy e la maschera come .tif"""
         os.makedirs(f"{self.output_dir}/images", exist_ok=True)
         os.makedirs(f"{self.output_dir}/masks", exist_ok=True)
         
-        with rasterio.open(
-            f"{self.output_dir}/images/{filename}.tif", 'w',
-            driver='GTiff', height=img_arr.shape[1], width=img_arr.shape[2],
-            count=img_arr.shape[0], dtype='uint16', crs=crs, transform=transform
-        ) as dst:
-            dst.write(img_arr)
+        # img_cube shape: (4, 6, 256, 256)
+        # Salvataggio immagine in formato binario NumPy (veloce e mantiene le 4D)
+        np.save(f"{self.output_dir}/images/{filename}.npy", img_cube.astype("uint16"))
         
+        # La maschera rimane .tif (2D)
         with rasterio.open(
             f"{self.output_dir}/masks/{filename}.tif", 'w',
             driver='GTiff', height=mask_arr.shape[0], width=mask_arr.shape[1],
-            count=1, dtype='uint8', nodata=0, crs=crs, transform=transform
+            count=1, dtype='uint8', nodata=0, crs="EPSG:32630", 
+            transform=rasterio.transform.from_origin(0,0,1,1) # dummy transform
         ) as dst:
             dst.write(mask_arr, 1)
-    
+        
     def process_task(self, task):
-        """Processa una singola cella con sampling probabilistico"""
+        """Versione Multi-temporale (T=4): Scarica 4 stagioni ed estrae chip 4D"""
         task_id = task['task_id']
         bbox = tuple(task['bbox'])
         
-        # Aggiorna sampling probs se presenti nel task
+        # Aggiorna sampling probs
         if 'sampling_probs' in task:
-            self.sampling_probs = {
-                int(k): v for k, v in task['sampling_probs'].items()
-            }
+            self.sampling_probs = {int(k): v for k, v in task['sampling_probs'].items()}
         
         logger.info(f"Worker {self.worker_id} processing task {task_id}: {bbox}")
         
@@ -202,85 +201,73 @@ class SatelliteDataWorkerBalanced:
             'chips_saved': 0,
             'chips_per_class': {},
             'status': 'success',
-            # Passa target al monitor
             'target_samples': task.get('target_samples', {}),
             'sampling_probs': task.get('sampling_probs', {})
         }
-        
-        
 
         try:
-            # Leggi poligoni nella bbox (DIRETTO - come codice funzionante)
+            # 1. Leggi poligoni
             local_gdf = gpd.read_file(self.gpkg_path, bbox=bbox)
-            
             if len(local_gdf) < 3:
                 result['status'] = 'skipped_few_polygons'
                 return result
             
-            # Mappa classi
-            local_gdf['label_id'] = local_gdf['EC_hcat_n'].map(
-                self.target_classes
-            )
+            local_gdf['label_id'] = local_gdf['EC_hcat_n'].map(self.target_classes)
             local_gdf = local_gdf.dropna(subset=['label_id'])
             
             if len(local_gdf) == 0:
                 result['status'] = 'skipped_no_target_classes'
                 return result
             
-            # *** FILTRO PROBABILISTICO (come generate_full_dataset.py) ***
+            # 2. Filtro probabilistico
             probs = local_gdf['label_id'].map(self.sampling_probs).fillna(0)
             local_gdf['save_me'] = probs >= np.random.rand(len(local_gdf))
             target_polys = local_gdf[local_gdf['save_me']]
-
-            # AGGIUNTO
-            sampling_ratio = len(target_polys) / len(local_gdf)
-            logger.info(
-                f"  Sampling: {len(local_gdf)} → {len(target_polys)} polygons "
-                f"({sampling_ratio:.1%} kept)"
-            )
             
             if len(target_polys) == 0:
                 result['status'] = 'skipped_sampling'
                 return result
             
-            logger.info(f"  After sampling: {len(target_polys)} polygons")
-            
-            # Scarica dati satellitari
+            # 3. Scarica dati satellitari (MODIFICATO PER T=4)
+            # Assumiamo che get_sentinel_data restituisca il DataArray di stackstac con 4 step temporali
             da = self.get_sentinel_data(bbox)
             if da is None:
                 result['status'] = 'failed_download'
                 return result
             
-            # Riproiezione
+            # 4. Riproiezione e Allineamento
             if local_gdf.crs != da.rio.crs:
                 local_gdf = local_gdf.to_crs(da.rio.crs)
                 target_polys = target_polys.to_crs(da.rio.crs)
             
-            # Genera maschera
+            # 5. Genera Maschera (2D)
+            # Usiamo il primo step temporale di 'da' come riferimento spaziale
             cube = make_geocube(
                 vector_data=local_gdf,
                 measurements=["label_id"],
-                like=da,
+                like=da.isel(time=0), 
                 fill=0
             )
             
+            # 6. Conversione in NumPy
+            # img_np shape: (4, 6, H, W) -> [Tempo, Bande, H, W]
             img_np = da.to_numpy()
+            # mask_np shape: (H, W)
             mask_np = cube.label_id.fillna(0).to_numpy().astype("uint8")
+            
             transform = da.rio.transform()
             
             if np.max(mask_np) == 0:
                 result['status'] = 'failed_empty_mask'
                 return result
             
-            # Estrai chip
+            # 7. Estrazione Chip
             chips_saved = 0
             chips_per_class = {}
             
             for _, row in target_polys.iterrows():
-                cx, cy = ~transform * (
-                    row.geometry.centroid.x,
-                    row.geometry.centroid.y
-                )
+                # Coordinate pixel dal centroide del poligono
+                cx, cy = ~transform * (row.geometry.centroid.x, row.geometry.centroid.y)
                 cx, cy = int(cx), int(cy)
                 
                 min_x = cx - self.chip_size // 2
@@ -288,48 +275,50 @@ class SatelliteDataWorkerBalanced:
                 min_y = cy - self.chip_size // 2
                 max_y = cy + self.chip_size // 2
                 
-                if (min_x < 0 or min_y < 0 or
-                    max_x > img_np.shape[2] or max_y > img_np.shape[1]):
+                # Controllo bordi spaziali
+                if (min_x < 0 or min_y < 0 or 
+                    max_x > img_np.shape[3] or max_y > img_np.shape[2]):
                     continue
                 
-                im_c = img_np[:, min_y:max_y, min_x:max_x]
+                # 🔥 SLICING 4D: [Tutti i tempi, Tutte le bande, Y, X]
+                im_c = img_np[:, :, min_y:max_y, min_x:max_x]
                 mk_c = mask_np[min_y:max_y, min_x:max_x]
                 
-                if (np.mean(im_c) > 0 and
-                    mk_c[self.chip_size//2, self.chip_size//2] > 0):
-                    
-                    class_id = int(mk_c[self.chip_size//2, self.chip_size//2])
-                    
-                    filename = f"worker{self.worker_id}_task{task_id}_class{class_id}_chip{chips_saved}"
-                    self.save_chip(
-                        im_c, mk_c,
-                        rasterio.windows.transform(
-                            Window(min_x, min_y, self.chip_size, self.chip_size),
-                            transform
-                        ),
-                        da.rio.crs,
-                        filename
-                    )
-                    
-                    chips_saved += 1
-                    chips_per_class[class_id] = chips_per_class.get(class_id, 0) + 1
+                # Controllo integrità del cubo (deve avere 4 tempi e 6 bande)
+                if im_c.shape == (4, 6, self.chip_size, self.chip_size):
+                    # Verifica che il pixel centrale sia valido
+                    if np.mean(im_c) > 0 and mk_c[self.chip_size//2, self.chip_size//2] > 0:
+                        
+                        class_id = int(mk_c[self.chip_size//2, self.chip_size//2])
+                        filename = f"worker{self.worker_id}_task{task_id}_class{class_id}_chip{chips_saved}"
+                        
+                        # Salvataggio (la funzione save_chip deve ora gestire .npy per l'immagine)
+                        self.save_chip(
+                            im_c, mk_c,
+                            rasterio.windows.transform(
+                                Window(min_x, min_y, self.chip_size, self.chip_size),
+                                transform
+                            ),
+                            da.rio.crs,
+                            filename
+                        )
+                        
+                        chips_saved += 1
+                        chips_per_class[class_id] = chips_per_class.get(class_id, 0) + 1
             
             result['chips_saved'] = chips_saved
             result['chips_per_class'] = chips_per_class
             
             if chips_saved > 0:
-                logger.info(
-                    f"  ✓ Task {task_id}: {chips_saved} chips | "
-                    f"Distribution: {dict(chips_per_class)}"
-                )
-            
+                logger.info(f"  ✓ Task {task_id}: {chips_saved} chips multi-temporali salvati.")
+                
         except Exception as e:
             logger.error(f"Error processing task {task_id}: {e}")
             result['status'] = 'failed'
             result['error'] = str(e)
         
         return result
-    
+        
     def start(self):
         """Avvia il worker"""
         logger.info(f"Worker {self.worker_id} started, waiting for tasks...")
